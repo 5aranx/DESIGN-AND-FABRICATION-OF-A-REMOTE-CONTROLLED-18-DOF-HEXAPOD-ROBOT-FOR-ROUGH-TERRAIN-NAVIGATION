@@ -290,6 +290,14 @@ respond as expected, send `d` over Serial and press each control to see which in
 - Adafruit GFX and SSD1306 libraries for the display.
 - PJRC Teensy 4.1 `USBHost_t36` and `Servo` libraries.
 
+## Contributors
+
+- Saransh Singh — firmware, electronics, mechanical design
+- shahidjnp60@gmail.com
+- smarthpanwar191@gmail.com
+- swayampanwar191@gmail.com
+- shrutishravya15@gmail.com
+
 ## License
 
 MIT (see the upstream hexapod project for the original IK work).
