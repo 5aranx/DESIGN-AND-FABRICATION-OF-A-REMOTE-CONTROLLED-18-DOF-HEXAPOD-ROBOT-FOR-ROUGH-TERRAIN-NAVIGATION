@@ -1,0 +1,16 @@
+# Arduino / Teensy build artifacts
+build/
+*.hex
+*.eep
+*.elf
+*.map
+*.o
+*.d
+*.a
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.arduino15/
