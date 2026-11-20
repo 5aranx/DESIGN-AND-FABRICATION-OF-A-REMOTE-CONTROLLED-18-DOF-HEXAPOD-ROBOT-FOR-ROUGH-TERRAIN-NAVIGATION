@@ -292,11 +292,11 @@ respond as expected, send `d` over Serial and press each control to see which in
 
 ## Contributors
 
-- Saransh Singh — firmware, electronics, mechanical design
-- shahidjnp60@gmail.com
-- smarthpanwar191@gmail.com
-- swayampanwar191@gmail.com
-- shrutishravya15@gmail.com
+- saranshsingh2006@gmial.com - Saransh Singh
+- shahidjnp60@gmail.com - Shahid Khan
+- smarthpanwar191@gmail.com - Smarth Panwar
+- swayampanwar191@gmail.com - Swayam Panwar
+- shrutishravya15@gmail.com - Shruti Shravya
 
 ## License
 
