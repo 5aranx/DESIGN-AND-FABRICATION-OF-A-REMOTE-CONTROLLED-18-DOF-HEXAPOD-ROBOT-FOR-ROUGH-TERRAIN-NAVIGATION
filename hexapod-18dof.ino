@@ -1,47 +1,33 @@
 /**
  * Hexapod - USB gamepad control + OLED battery monitor + MPU6050 body leveling
- * (Teensy 4.1, custom PCB). Version for 18x MG995 180-degree servos.
+ * (Teensy 4.1, custom PCB). 18x MG995 180-degree servos.
  *
- * IK / leg geometry based on Emre Kalem & Ozgur Toprak Onsoy's hexapod (MIT).
+ * Walking is done in SERVO-ANGLE space around the measured STAND pose (no IK).
  *
  * CONTROLS
- *   Left stick .......... walk forward/back + strafe left/right
+ *   A ................... STAND (and ARM walking if AUTO_ARM)
+ *   B ................... SIT (boot pose)
+ *   START ............... ARM / DISARM walking
+ *   Left stick Y ........ walk forward / back
  *   Right stick X ....... turn (yaw)
- *   Right stick Y ....... body height (up = higher)
- *   D-pad Up/Down ....... step height  + / -
- *   D-pad Left/Right .... gait speed   - / +
- *   LB / RB ............. step length  - / +
- *   LT / RT ............. body height  - / +  (5 mm steps)
- *   A ................... stand        B ... sit / low pose
+ *   Right stick Y ....... body height (femur offset)
+ *   D-pad Up/Down ....... step height + / -
+ *   D-pad Left/Right .... gait speed  - / +
+ *   LB / RB ............. step length - / +
+ *   LT / RT ............. body height - / +
  *   X ................... toggle gait (TRIPOD <-> WAVE)
- *   Y ................... print status to Serial
- *   L3 (left stick click) TOGGLE BODY LEVELING (boots OFF)  [BTN_L3, verify with 'd' dump]
- *   START ............... ARM / DISARM walking (boots DISARMED)
- *   BACK ................ reset all settings to defaults
+ *   Y ................... print status
+ *   L3 .................. toggle body leveling
+ *   BACK ................ reset settings
  *
- * Serial monitor (115200):  'd' = toggle raw gamepad dump, 's' = print status,
- *                           'i' = I2C scan, 'l' = toggle leveling,
- *                           'c' = recalibrate IMU (robot flat and still!)
+ * Serial monitor (115200): 'd' gamepad dump, 's' status, 'i' I2C scan,
+ *                          'l' leveling, 'c' recalibrate IMU
  *
- * I2C bus (Wire: SDA=pin 18, SCL=pin 19): SSD1306 OLED (0x3C) + MPU6050 (0x68).
- * Battery sense: pin 38 (voltage), pin 39 (current).
+ * POSES:  SIT   = coxa 90, femur 180, tibia 160
+ *         STAND = coxa 90, femur 105, tibia 160
+ * Tibia is hard-limited to 0..160 deg.
  *
- * SERVO PINS (from wiring sheet)      coxa femur tibia
- *   Leg1 RF                             2     3     4
- *   Leg2 RM                             5     6     7
- *   Leg3 RR                             8     9    10
- *   Leg4 LR                            29    14    15
- *   Leg5 LM                            37    25    28
- *   Leg6 LF                            24    33    36
- *
- * BODY FRAME: +X forward, +Y left, +Z up (matches LEG_X / LEG_Y below).
- * MPU6050 is mounted with X and Y inverted (180 deg about Z) -> see imuRemapAxes().
- *
- * IMU CALIBRATION happens at power-up (gyro bias + accel offset, about 4 s).
- * Power the robot on while it stands/sits on FLAT ground and do not touch it.
- *
- * FIRST TIME: set CAL_MODE 1, upload, mount all servo horns at center (1500 us), then CAL_MODE 0.
- * Test with the robot lifted on a stand first!
+ * Test with the robot lifted first!
  */
 
 #include <USBHost_t36.h>
@@ -54,16 +40,9 @@
 
 // ======================= CONFIG =======================
 
-// ---- Leg geometry (mm) ----
-const float COXA_LENGTH  = 38.0f;
-const float FEMUR_LENGTH = 86.25f;
-const float TIBIA_LENGTH = 160.5f;
-
-// Order: Leg1=RF, Leg2=RM, Leg3=RR, Leg4=LR, Leg5=LM, Leg6=LF
 const float LEG_X[6] = {  100.94f,    0.0f, -100.94f, -100.94f,    0.0f,  100.94f };
 const float LEG_Y[6] = {  -57.11f, -105.72f,  -57.11f,   57.11f, 105.72f,   57.11f };
 
-// ---- Servo pins from wiring sheet: {coxa, femur, tibia} ----
 const uint8_t SERVO_PIN[6][3] = {
   {  2,  3,  4 },   // Leg1 (RF)
   {  5,  6,  7 },   // Leg2 (RM)
@@ -77,33 +56,48 @@ float SERVO_TRIM[6][3] = {
   { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 },
   { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }
 };
-// If a joint moves the wrong way, set its entry to true (e.g. { false, true, true }).
 const bool SERVO_INV[6][3] = {
   { false, false, false }, { false, false, false }, { false, false, false },
   { false, false, false }, { false, false, false }, { false, false, false }
 };
 
 // ---- Servo pulse scaling (MG995, 180 deg) ----
-// 500..2500 us = 180 deg  ->  ~11.11 us per degree.
-// If your servos sweep less than 180 deg, lower SERVO_SPAN_DEG to the measured value.
-const float SERVO_FULL_US    = 2000.0f;   // (max us - min us) for the full span
-const float SERVO_SPAN_DEG   = 180.0f;    // full mechanical span of the servo
+const float SERVO_FULL_US    = 2000.0f;
+const float SERVO_SPAN_DEG   = 180.0f;
 const float SERVO_US_PER_DEG = SERVO_FULL_US / SERVO_SPAN_DEG;
+const int SERVO_US_MIN = 1500 - (int)(90.0f * SERVO_US_PER_DEG + 0.5f);   // 500 us
+const int SERVO_US_MAX = 1500 + (int)(90.0f * SERVO_US_PER_DEG + 0.5f);   // 2500 us
 
-// Full 180 deg range centered on 1500 us
-const int SERVO_US_MIN = 1500 - (int)(90.0f * SERVO_US_PER_DEG + 0.5f);   // 500 us  (0 deg)
-const int SERVO_US_MAX = 1500 + (int)(90.0f * SERVO_US_PER_DEG + 0.5f);   // 2500 us (180 deg)
+// ---- Per-joint hard angle limits ----
+//                                   coxa   femur  tibia
+const float JOINT_MIN_DEG[3] = {     0.0f,   0.0f,   0.0f };
+const float JOINT_MAX_DEG[3] = {   180.0f, 180.0f, 160.0f };   // tibia can NEVER exceed 160
+
+// ---- Walking tuning (servo-angle gait) ----
+const float STRIDE_DEG_PER_MM = 0.75f;   // coxa sweep (deg) per mm of step length
+const float LIFT_DEG_PER_MM   = 0.8f;    // femur lift (deg) per mm of step height
+const float TIBIA_LIFT_RATIO  = 0.8f;    // tibia bends this many deg per deg of femur lift
+const float TURN_DEG          = 15.0f;   // coxa sweep when turning at full stick
+
+// DIRECTION SIGNS - if the robot moves the wrong way, flip these:
+const float FEMUR_LIFT_SIGN = -1.0f;     // -1: foot lifts when femur angle goes DOWN from stand
+const float TIBIA_LIFT_SIGN = -1.0f;     // -1: tibia angle goes DOWN while lifting
+const float FWD_SIGN[6]  = {  1,  1,  1,  1,  1,  1 };    // flip a leg that sweeps backward
+const float TURN_SIGN[6] = {  1,  1,  1, -1, -1, -1 };    // right/left sides mirrored
 
 // ---- Defaults / limits ----
-const float STAND_Z          = -40.0f;
-const float SIT_Z            = -5.0f;
-const float Z_MIN            = -110.0f;
-const float Z_MAX            =    0.0f;
-const float DEF_STEP_LENGTH  = 50.0f;
-const float DEF_STEP_HEIGHT  = 60.0f;
-const float DEF_CYCLE_HZ     = 0.7f;
-const float ROTATION_STEP_RAD = 15.0f * M_PI / 180.0f;
-const float SMOOTHING        = 0.35f;
+const bool  AUTO_ARM         = true;     // pressing A (stand) also arms walking
+const float DEF_STEP_LENGTH  = 40.0f;
+const float DEF_STEP_HEIGHT  = 35.0f;
+const float DEF_CYCLE_HZ     = 0.6f;
+const float COXA_MIN_DEG     = 45.0f;
+const float COXA_MAX_DEG     = 135.0f;
+const float BODY_OFF_MAX     = 25.0f;
+
+// ---- Anti-jitter + current limiting ----
+const float SERVO_DEADBAND_DEG = 0.3f;
+const float SERVO_MAX_DPS      = 90.0f;
+const float FRAME_DT           = 0.02f;
 
 // ---- Gamepad mapping ----
 const int AXIS_LX = 0, AXIS_LY = 1, AXIS_RX = 2, AXIS_RY = 5, AXIS_HAT = 9;
@@ -113,35 +107,35 @@ const float DEADZONE = 0.15f;
 const int BTN_X = 0, BTN_A = 1, BTN_B = 2, BTN_Y = 3;
 const int BTN_LB = 4, BTN_RB = 5, BTN_LT = 6, BTN_RT = 7;
 const int BTN_BACK = 8, BTN_START = 9;
-const int BTN_L3 = 10;   // left stick click - check the number with the 'd' dump
+const int BTN_L3 = 10;
 
 // ---- OLED + battery monitor ----
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-const int V_SENSE_PIN = 38;           // A14
-const int I_SENSE_PIN = 39;           // A15
+const int V_SENSE_PIN = 38;
+const int I_SENSE_PIN = 39;
 const float V_DIVIDER_RATIO = 11.352;
 const float AMPS_PER_VOLT   = 18.18;
 const float BATTERY_MAH     = 3300.0;
 const float MIN_VOLTS       = 10.20;
 const float WARN_VOLTS      = 10.35;
 const unsigned long WARN_DELAY_MS = 3500;
-const unsigned long OLED_PERIOD_MS = 500;   // redraw rate (I2C transfer blocks ~25 ms)
+const unsigned long OLED_PERIOD_MS = 500;
 
 // ---- MPU6050 + body leveling ----
 const uint8_t  MPU_ADDR        = 0x68;
-const float    GYRO_SENS       = 65.5f;      // LSB per deg/s at +-500 dps
-const float    ACC_SENS        = 16384.0f;   // LSB per g at +-2 g
-const float    IMU_ALPHA       = 0.98f;      // gyro weight in the complementary filter
-const uint32_t IMU_PERIOD_US   = 5000;       // ~200 Hz attitude update
-const int      IMU_CAL_SAMPLES = 1500;       // ~4 s at power-up
+const float    GYRO_SENS       = 65.5f;
+const float    ACC_SENS        = 16384.0f;
+const float    IMU_ALPHA       = 0.98f;
+const uint32_t IMU_PERIOD_US   = 5000;
+const int      IMU_CAL_SAMPLES = 1500;
 
-const float LEVEL_MAX_DEG    = 12.0f;   // max body correction applied to the feet
-const float LEVEL_MAX_RATE   = 60.0f;   // deg/s slew limit on the correction
-const float TILT_CUTOFF_DEG  = 45.0f;   // leveling switches OFF beyond this (fallen / lifted)
-// If the body tilts the WRONG way when you enable leveling, set the matching sign to -1.
+const float LEVEL_MAX_DEG    = 20.0f;
+const float LEVEL_MAX_RATE   = 120.0f;
+const float TILT_CUTOFF_DEG  = 45.0f;
 const float LEVEL_ROLL_SIGN  = 1.0f;
 const float LEVEL_PITCH_SIGN = 1.0f;
+const float LEVEL_FEMUR_GAIN = 1.5f;
 
 // ======================= STATE =======================
 
@@ -150,12 +144,6 @@ USBHub hub1(myusb);
 USBHIDParser hid1(myusb);
 USBHIDParser hid2(myusb);
 JoystickController joystick(myusb);
-
-struct Vec3 { float x, y, z; };
-
-Vec3 HOME[6];
-Vec3 target[6];
-float neutralAng[6];
 
 struct Gait { const char* name; float swing; float off[6]; };
 const Gait GAITS[2] = {
@@ -167,15 +155,20 @@ int   gaitIdx    = 0;
 float stepLength = DEF_STEP_LENGTH;
 float stepHeight = DEF_STEP_HEIGHT;
 float cycleHz    = DEF_CYCLE_HZ;
-float bodyZ      = STAND_Z;
+float bodyOff    = 0.0f;
 float gaitT      = 0.0f;
 bool  armed      = false;
 bool  dbg        = false;
+bool  wasMoving  = false;
+
+//                              coxa  femur tibia
+const float STAND_POSE[3] = {  90.0f, 105.0f, 160.0f };
+const float SIT_POSE[3]   = {  90.0f, 180.0f, 160.0f };
+bool poseStand = false;
 
 uint32_t prevButtons = 0;
 int      prevHat     = 15;
 
-// OLED / battery state
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 bool  oledOk = false;
 float filteredVolts = 0.0, shownVolts = 0.0, filteredAmps = 0.0;
@@ -189,7 +182,7 @@ int  battPct = 0;
 struct PID {
   float kp, ki, kd, i, last, outMax;
   float run(float err, float dt) {
-    i = constrain(i + ki * err * dt, -outMax, outMax);        // anti-windup clamp
+    i = constrain(i + ki * err * dt, -outMax, outMax);
     float d = (dt > 0.0f) ? kd * (err - last) / dt : 0.0f;
     last = err;
     return constrain(kp * err + i + d, -outMax, outMax);
@@ -197,22 +190,20 @@ struct PID {
   void reset() { i = 0.0f; last = 0.0f; }
 };
 
-// Error is the measured tilt itself; the output is the angle the feet are rotated by.
-// Start with these, then raise ki for a firmer hold or lower it if the body hunts.
-PID rollPID  = { 0.3f, 1.0f, 0.0f, 0, 0, LEVEL_MAX_DEG };
-PID pitchPID = { 0.3f, 1.0f, 0.0f, 0, 0, LEVEL_MAX_DEG };
+PID rollPID  = { 1.0f, 2.0f, 0.0f, 0, 0, LEVEL_MAX_DEG };
+PID pitchPID = { 1.0f, 2.0f, 0.0f, 0, 0, LEVEL_MAX_DEG };
 
-float gxBias = 0, gyBias = 0, gzBias = 0;     // raw counts, sensor frame
-float axOff  = 0, ayOff  = 0, azOff  = 0;     // raw counts, sensor frame
+float gxBias = 0, gyBias = 0, gzBias = 0;
+float axOff  = 0, ayOff  = 0, azOff  = 0;
 
-float imuRoll = 0, imuPitch = 0;              // deg, body frame (roll + = left side up, pitch + = nose down)
-float imuYawRate = 0;                         // deg/s, body frame (not used yet)
+float imuRoll = 0, imuPitch = 0;
+float imuYawRate = 0;
 bool  imuOk = false;
 bool  levelOn = false;
 uint8_t  imuFails = 0;
 uint32_t lastImuUs = 0;
 
-float levelRoll = 0, levelPitch = 0;          // correction currently applied to the feet (deg)
+float levelRoll = 0, levelPitch = 0;
 
 void imuWrite(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MPU_ADDR);
@@ -222,12 +213,11 @@ void imuWrite(uint8_t reg, uint8_t val) {
 }
 
 static inline int16_t imuRead16() {
-  uint8_t hi = Wire.read();     // separate statements: operand order of | is unspecified in C++
+  uint8_t hi = Wire.read();
   uint8_t lo = Wire.read();
   return (int16_t)((hi << 8) | lo);
 }
 
-// Accel + gyro in one 14-byte burst (registers 0x3B..0x48)
 bool imuReadRaw(int16_t &ax, int16_t &ay, int16_t &az,
                 int16_t &gx, int16_t &gy, int16_t &gz) {
   Wire.beginTransmission(MPU_ADDR);
@@ -238,21 +228,19 @@ bool imuReadRaw(int16_t &ax, int16_t &ay, int16_t &az,
   ax = imuRead16();
   ay = imuRead16();
   az = imuRead16();
-  imuRead16();                  // skip temperature
+  imuRead16();
   gx = imuRead16();
   gy = imuRead16();
   gz = imuRead16();
   return true;
 }
 
-// Sensor frame -> body frame (chip rotated 180 deg about Z): X and Y inverted, Z unchanged
 static inline void imuRemapAxes(float &x, float &y, float &z) {
   x = -x;
   y = -y;
   (void)z;
 }
 
-// Robot must be flat and still. Gyro bias + accel offset (Z is expected to read +1 g).
 bool imuCalibrate(int samples) {
   double sgx = 0, sgy = 0, sgz = 0, sax = 0, say = 0, saz = 0;
   int n = 0;
@@ -269,7 +257,7 @@ bool imuCalibrate(int samples) {
   if (n < samples / 2) return false;
 
   gxBias = sgx / n;  gyBias = sgy / n;  gzBias = sgz / n;
-  axOff  = sax / n;  ayOff  = say / n;  azOff  = saz / n - ACC_SENS;   // +1 g on Z when flat
+  axOff  = sax / n;  ayOff  = say / n;  azOff  = saz / n - ACC_SENS;
 
   imuRoll = 0; imuPitch = 0;
   rollPID.reset(); pitchPID.reset();
@@ -284,11 +272,11 @@ void imuInit() {
     Serial.println("MPU6050 not found at 0x68 - leveling disabled. Send 'i' to scan I2C.");
     return;
   }
-  imuWrite(0x6B, 0x01);   // wake up, gyro-X PLL clock
+  imuWrite(0x6B, 0x01);
   delay(100);
-  imuWrite(0x1A, 0x03);   // DLPF ~44 Hz
-  imuWrite(0x1B, 0x08);   // gyro +-500 dps
-  imuWrite(0x1C, 0x00);   // accel +-2 g
+  imuWrite(0x1A, 0x03);
+  imuWrite(0x1B, 0x08);
+  imuWrite(0x1C, 0x00);
   delay(500);
 
   Serial.println("Calibrating IMU - keep the robot flat and still...");
@@ -312,21 +300,6 @@ void setLeveling(bool on) {
   Serial.println(levelOn ? "LEVELING ON" : "LEVELING OFF");
 }
 
-// Rotates a foot target (body frame) about the body origin. Used on every foot before the IK.
-void levelFoot(float &x, float &y, float &z, float rollDeg, float pitchDeg) {
-  const float r = rollDeg  * DEG_TO_RAD;
-  const float p = pitchDeg * DEG_TO_RAD;
-
-  const float y1 = y * cosf(r) - z * sinf(r);     // roll about X
-  const float z1 = y * sinf(r) + z * cosf(r);
-
-  const float x2 =  x * cosf(p) + z1 * sinf(p);   // pitch about Y
-  const float z2 = -x * sinf(p) + z1 * cosf(p);
-
-  x = x2; y = y1; z = z2;
-}
-
-// Runs at ~200 Hz from loop(): attitude estimate + leveling PID + slew limit.
 void imuUpdate() {
   if (!imuOk) return;
 
@@ -334,7 +307,7 @@ void imuUpdate() {
   if (nowUs - lastImuUs < IMU_PERIOD_US) return;
   float dt = (nowUs - lastImuUs) * 1e-6f;
   lastImuUs = nowUs;
-  if (dt > 0.05f) dt = 0.05f;               // OLED redraw can stall the loop for ~25 ms
+  if (dt > 0.05f) dt = 0.05f;
 
   int16_t rax, ray, raz, rgx, rgy, rgz;
   if (!imuReadRaw(rax, ray, raz, rgx, rgy, rgz)) {
@@ -347,10 +320,10 @@ void imuUpdate() {
   }
   imuFails = 0;
 
-  float gx = (rgx - gxBias) / GYRO_SENS;    // deg/s
+  float gx = (rgx - gxBias) / GYRO_SENS;
   float gy = (rgy - gyBias) / GYRO_SENS;
   float gz = (rgz - gzBias) / GYRO_SENS;
-  float ax = (rax - axOff) / ACC_SENS;      // g
+  float ax = (rax - axOff) / ACC_SENS;
   float ay = (ray - ayOff) / ACC_SENS;
   float az = (raz - azOff) / ACC_SENS;
 
@@ -358,8 +331,6 @@ void imuUpdate() {
   imuRemapAxes(ax, ay, az);
   imuYawRate = gz;
 
-  // Complementary filter. When the accel magnitude is far from 1 g (leg impacts,
-  // acceleration) the accel is ignored for that sample and only the gyro is used.
   const float amag = sqrtf(ax * ax + ay * ay + az * az);
   const float a = (amag > 0.85f && amag < 1.15f) ? IMU_ALPHA : 1.0f;
   const float accRoll  = atan2f(ay, az) * RAD_TO_DEG;
@@ -368,7 +339,6 @@ void imuUpdate() {
   imuRoll  = a * (imuRoll  + gx * dt) + (1.0f - a) * accRoll;
   imuPitch = a * (imuPitch + gy * dt) + (1.0f - a) * accPitch;
 
-  // Safety: fallen over or picked up -> stop correcting
   if (levelOn && (fabsf(imuRoll) > TILT_CUTOFF_DEG || fabsf(imuPitch) > TILT_CUTOFF_DEG)) {
     setLeveling(false);
     Serial.println("Tilt too large - leveling OFF");
@@ -376,14 +346,10 @@ void imuUpdate() {
 
   float wantRoll = 0.0f, wantPitch = 0.0f;
   if (levelOn) {
-    // Positive roll (left up) -> feet rotated by +roll shorten the left legs / lengthen the right.
-    // Positive pitch (nose down) -> front legs lengthen. The integral term holds the correction
-    // while the body is level, so P alone never has to fight itself.
     wantRoll  = LEVEL_ROLL_SIGN  * rollPID.run(imuRoll,  dt);
     wantPitch = LEVEL_PITCH_SIGN * pitchPID.run(imuPitch, dt);
   }
 
-  // Slew limit so the legs never jerk (also eases back to 0 when leveling is switched off)
   const float maxStep = LEVEL_MAX_RATE * dt;
   levelRoll  += constrain(wantRoll  - levelRoll,  -maxStep, maxStep);
   levelPitch += constrain(wantPitch - levelPitch, -maxStep, maxStep);
@@ -391,17 +357,13 @@ void imuUpdate() {
 
 // ======================= HELPERS =======================
 
-// Servo output uses Teensy hardware PWM (50 Hz) instead of the Servo library,
-// because the Servo library only drives 12 servos and this robot has 18.
 void servoAttach(uint8_t pin) {
   pinMode(pin, OUTPUT);
   analogWriteFrequency(pin, 50);
 }
 void servoWriteUs(uint8_t pin, int us) {
-  analogWrite(pin, (uint32_t)(us * (65535.0f / 20000.0f) + 0.5f));   // 16-bit, 20 ms period
+  analogWrite(pin, (uint32_t)(us * (65535.0f / 20000.0f) + 0.5f));
 }
-
-static inline float rad2deg(float r) { return r * 180.0f / M_PI; }
 
 float normAxis(int raw, bool inv) {
   float n = (raw - 127.5f) / 127.5f;
@@ -411,97 +373,85 @@ float normAxis(int raw, bool inv) {
   return constrain(n, -1.0f, 1.0f);
 }
 
-void calculateIK(int leg, const Vec3& tgt, float out[3]) {
-  float rx = tgt.x - LEG_X[leg];
-  float ry = tgt.y - LEG_Y[leg];
-  float rz = tgt.z;
+float servoLast[6][3];
+bool  servoInit[6][3];
 
-  const float c = cosf(-neutralAng[leg]);
-  const float s = sinf(-neutralAng[leg]);
-  const float tx = rx * c - ry * s;
-  const float ty = rx * s + ry * c;
-
-  const float lxy = sqrtf(tx * tx + ty * ty);
-  const float lf  = lxy - COXA_LENGTH;
-  float D = sqrtf(lf * lf + rz * rz);
-
-  const float maxD = FEMUR_LENGTH + TIBIA_LENGTH - 0.001f;
-  const float minD = fabsf(FEMUR_LENGTH - TIBIA_LENGTH) + 0.001f;
-  D = constrain(D, minD, maxD);
-
-  out[2] = rad2deg(acosf((FEMUR_LENGTH * FEMUR_LENGTH + TIBIA_LENGTH * TIBIA_LENGTH - D * D) /
-                         (2.0f * FEMUR_LENGTH * TIBIA_LENGTH)) - M_PI);
-  const float b1 = atan2f(rz, lf);
-  const float b2 = acosf((FEMUR_LENGTH * FEMUR_LENGTH + D * D - TIBIA_LENGTH * TIBIA_LENGTH) /
-                         (2.0f * FEMUR_LENGTH * D));
-  out[1] = rad2deg(b1 + b2);
-  out[0] = rad2deg(atan2f(ty, tx));
-}
-
-// angle is 0..180 deg (90 = center). Converted to pulse width using SERVO_US_PER_DEG.
 void writeServo(int leg, int j, float angle) {
   if (SERVO_INV[leg][j]) angle = 180.0f - angle;
   angle += SERVO_TRIM[leg][j];
-  angle = constrain(angle, 0.0f, 180.0f);          // hard 180 deg limit
-  int us = SERVO_US_MIN + (int)(angle * SERVO_US_PER_DEG + 0.5f);
+  angle = constrain(angle, JOINT_MIN_DEG[j], JOINT_MAX_DEG[j]);
+
+  if (!servoInit[leg][j]) {
+    servoInit[leg][j] = true;
+    servoLast[leg][j] = angle;
+  } else {
+    float diff = angle - servoLast[leg][j];
+    if (fabsf(diff) >= SERVO_DEADBAND_DEG) {
+      const float maxStep = SERVO_MAX_DPS * FRAME_DT;
+      servoLast[leg][j] += constrain(diff, -maxStep, maxStep);
+    }
+  }
+  float out = constrain(servoLast[leg][j], JOINT_MIN_DEG[j], JOINT_MAX_DEG[j]);
+  int us = SERVO_US_MIN + (int)(out * SERVO_US_PER_DEG + 0.5f);
   servoWriteUs(SERVO_PIN[leg][j], us);
 }
 
-void writeLeg(int leg) {
-  // Leveling is applied to a copy, so the smoothed target[] used by the gait stays untouched
-  Vec3 t = target[leg];
-  if (levelRoll != 0.0f || levelPitch != 0.0f) levelFoot(t.x, t.y, t.z, levelRoll, levelPitch);
-
-  float a[3];
-  calculateIK(leg, t, a);
-  float ax = constrain(90.0f + a[0], 45.0f, 135.0f);   // coxa limited to protect the physical stopper
-  float ay = 90.0f + a[1];
-  float az = fabsf(a[2]);
-  writeServo(leg, 0, ax);
-  writeServo(leg, 1, ay);
-  writeServo(leg, 2, az);
+void writePose(const float pose[3]) {
+  for (int leg = 0; leg < 6; leg++)
+    for (int j = 0; j < 3; j++) writeServo(leg, j, pose[j]);
 }
 
-Vec3 footTarget(int i, float vx, float vy, float rot, bool moving) {
-  Vec3 h = HOME[i];
-  if (!moving) return { h.x, h.y, bodyZ };
+// Servo angles of one leg while standing / walking (offsets from STAND_POSE).
+void computeLegAngles(int i, float vx, float rot, bool moving, float out[3]) {
+  float coxaOff = 0.0f, lift = 0.0f;
 
-  const Gait& g = GAITS[gaitIdx];
-  float p = fmodf(gaitT + g.off[i], 1.0f);
-  float stride, lift = 0.0f;
-  if (p < g.swing) {
-    float u = p / g.swing;
-    stride = u - 0.5f;
-    lift = sinf(u * M_PI) * stepHeight;
-  } else {
-    float u = (p - g.swing) / (1.0f - g.swing);
-    stride = 0.5f - u;
+  if (moving) {
+    const Gait& g = GAITS[gaitIdx];
+    float p = fmodf(gaitT + g.off[i], 1.0f);
+    float stride;
+    if (p < g.swing) {                              // swing: foot in the air, moves forward
+      float u = p / g.swing;
+      stride = u - 0.5f;
+      lift = sinf(u * M_PI) * stepHeight * LIFT_DEG_PER_MM;
+    } else {                                        // stance: foot on ground, moves backward
+      float u = (p - g.swing) / (1.0f - g.swing);
+      stride = 0.5f - u;
+    }
+    coxaOff = stride * (vx * stepLength * STRIDE_DEG_PER_MM * FWD_SIGN[i] +
+                        rot * TURN_DEG * TURN_SIGN[i]);
   }
 
-  const float ang = rot * stride * ROTATION_STEP_RAD;
-  const float cr = cosf(ang), sr = sinf(ang);
-  Vec3 r;
-  r.x = h.x * cr - h.y * sr + vx * stride * stepLength;
-  r.y = h.x * sr + h.y * cr + vy * stride * stepLength;
-  r.z = bodyZ + lift;
-  return r;
+  float cox = STAND_POSE[0] + coxaOff;
+  float fem = STAND_POSE[1] + bodyOff + FEMUR_LIFT_SIGN * lift;
+  float tib = STAND_POSE[2] + TIBIA_LIFT_SIGN * lift * TIBIA_LIFT_RATIO;
+
+  if (levelOn) {
+    const float sy = (LEG_Y[i] > 1.0f) ? 1.0f : (LEG_Y[i] < -1.0f ? -1.0f : 0.0f);
+    const float sx = (LEG_X[i] > 1.0f) ? 1.0f : (LEG_X[i] < -1.0f ? -1.0f : 0.0f);
+    fem += LEVEL_FEMUR_GAIN * ( levelRoll * sy - levelPitch * sx);
+  }
+
+  out[0] = constrain(cox, COXA_MIN_DEG, COXA_MAX_DEG);
+  out[1] = constrain(fem, JOINT_MIN_DEG[1], JOINT_MAX_DEG[1]);
+  out[2] = constrain(tib, JOINT_MIN_DEG[2], JOINT_MAX_DEG[2]);   // tibia 0..160 only
 }
 
 void resetDefaults() {
   stepLength = DEF_STEP_LENGTH;
   stepHeight = DEF_STEP_HEIGHT;
   cycleHz = DEF_CYCLE_HZ;
-  bodyZ = STAND_Z;
+  bodyOff = 0.0f;
   gaitIdx = 0;
 }
 
 void printStatus() {
   Serial.print("armed="); Serial.print(armed);
+  Serial.print(" pose="); Serial.print(poseStand ? "STAND" : "SIT");
   Serial.print(" gait="); Serial.print(GAITS[gaitIdx].name);
   Serial.print(" stepLen="); Serial.print(stepLength);
   Serial.print(" stepH="); Serial.print(stepHeight);
   Serial.print(" speed="); Serial.print(cycleHz);
-  Serial.print("Hz bodyZ="); Serial.print(bodyZ);
+  Serial.print("Hz bodyOff="); Serial.print(bodyOff);
   Serial.print(" batt="); Serial.print(shownVolts, 2);
   Serial.print("V "); Serial.print(filteredAmps, 2);
   Serial.print("A "); Serial.print(battPct);
@@ -517,7 +467,6 @@ void printStatus() {
 
 // ======================= BATTERY / OLED =======================
 
-// Dummy read to settle the ADC mux, then median of N samples (rejects servo-noise spikes)
 float readMedianPinVolts(int pin) {
   const int N = 9;
   float samples[N];
@@ -564,7 +513,7 @@ void batteryInit() {
   Wire.begin();
   Wire.setClock(400000);
   oledOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  if (!oledOk) oledOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3D);   // some modules use 0x3D
+  if (!oledOk) oledOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3D);
   if (oledOk) {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -576,7 +525,7 @@ void batteryInit() {
     Serial.println("OLED not found (tried 0x3C, 0x3D) - continuing without display. Send 'i' to scan I2C.");
   }
 
-  delay(300);   // let rails settle at idle (servos not attached yet)
+  delay(300);
 
   filteredVolts = readMedianPinVolts(V_SENSE_PIN) * V_DIVIDER_RATIO;
   shownVolts = filteredVolts;
@@ -626,7 +575,7 @@ void drawOLED(uint32_t now) {
     display.setTextColor(SSD1306_WHITE);
   } else {
     display.print(armed ? "ARMED  " : "DISARM ");
-    display.print(GAITS[gaitIdx].name);
+    display.print(poseStand ? "STAND" : "SIT");
   }
 
   display.setTextSize(2);
@@ -642,7 +591,6 @@ void drawOLED(uint32_t now) {
   display.print(filteredAmps, 2);
   display.print("A");
 
-  // Attitude line (y = 33..41, just above the divider)
   display.setCursor(0, 33);
   if (imuOk) {
     char buf[28];
@@ -670,29 +618,17 @@ void setup() {
   Serial.begin(115200);
   myusb.begin();
 
-  // Battery + OLED first, while servos are still idle (auto-zeroes the current sensor)
   batteryInit();
-
-  // IMU calibration also happens while the servos are idle. Keep the robot flat and still.
   imuInit();
 
   analogWriteResolution(16);
-
-  const float reach = COXA_LENGTH + FEMUR_LENGTH * cosf(M_PI / 4) +
-                      TIBIA_LENGTH * cosf(-M_PI / 4);
-  for (int i = 0; i < 6; i++) {
-    neutralAng[i] = atan2f(LEG_Y[i], LEG_X[i]);
-    HOME[i] = { LEG_X[i] + reach * cosf(neutralAng[i]),
-                LEG_Y[i] + reach * sinf(neutralAng[i]), STAND_Z };
-    target[i] = HOME[i];
-  }
 
   for (int i = 0; i < 6; i++) {
     for (int j = 0; j < 3; j++) servoAttach(SERVO_PIN[i][j]);
 #if CAL_MODE
     for (int j = 0; j < 3; j++) writeServo(i, j, 90.0f);
 #else
-    writeLeg(i);
+    for (int j = 0; j < 3; j++) writeServo(i, j, SIT_POSE[j]);
 #endif
     delay(150);
   }
@@ -702,7 +638,7 @@ void setup() {
   while (true) { delay(1000); }
 #endif
 
-  Serial.println("Hexapod ready. Plug gamepad, press START to ARM. L3 or 'l' toggles leveling.");
+  Serial.println("Hexapod ready (sitting). A = STAND (+ARM), left stick = walk.");
   lastImuUs = micros();
   delay(500);
   lastImuUs = micros();
@@ -728,7 +664,7 @@ void loop() {
     }
   }
 
-  imuUpdate();                            // ~200 Hz, own timer
+  imuUpdate();
 
   static uint32_t lastMs = 0;
   uint32_t now = millis();
@@ -737,14 +673,13 @@ void loop() {
   lastMs = now;
   if (dt > 0.1f) dt = 0.02f;
 
-  float vx = 0, vy = 0, rot = 0;
+  float vx = 0, rot = 0;
 
   if (joystick) {
     const uint32_t b = joystick.getButtons();
     const uint32_t pressed = b & ~prevButtons;
     prevButtons = b;
 
-    const float lx = normAxis(joystick.getAxis(AXIS_LX), INV_LX);
     const float ly = normAxis(joystick.getAxis(AXIS_LY), INV_LY);
     const float rx = normAxis(joystick.getAxis(AXIS_RX), INV_RX);
     const float ry = normAxis(joystick.getAxis(AXIS_RY), INV_RY);
@@ -756,8 +691,12 @@ void loop() {
     }
     if (pressed & (1u << BTN_BACK)) { resetDefaults(); Serial.println("defaults"); }
     if (pressed & (1u << BTN_L3)) setLeveling(!levelOn);
-    if (pressed & (1u << BTN_A)) bodyZ = STAND_Z;
-    if (pressed & (1u << BTN_B)) bodyZ = SIT_Z;
+    if (pressed & (1u << BTN_A)) {
+      poseStand = true;
+      Serial.println("STAND");
+      if (AUTO_ARM && !armed) { armed = true; Serial.println("ARMED (auto)"); }
+    }
+    if (pressed & (1u << BTN_B)) { poseStand = false; Serial.println("SIT"); }
     if (pressed & (1u << BTN_X)) {
       gaitIdx = (gaitIdx + 1) % 2;
       Serial.print("gait: "); Serial.println(GAITS[gaitIdx].name);
@@ -765,8 +704,8 @@ void loop() {
     if (pressed & (1u << BTN_Y)) printStatus();
     if (pressed & (1u << BTN_LB)) stepLength = constrain(stepLength - 5, 20, 90);
     if (pressed & (1u << BTN_RB)) stepLength = constrain(stepLength + 5, 20, 90);
-    if (pressed & (1u << BTN_LT)) bodyZ = constrain(bodyZ + 5, Z_MIN, Z_MAX);
-    if (pressed & (1u << BTN_RT)) bodyZ = constrain(bodyZ - 5, Z_MIN, Z_MAX);
+    if (pressed & (1u << BTN_LT)) bodyOff = constrain(bodyOff + 5.0f, -BODY_OFF_MAX, BODY_OFF_MAX);
+    if (pressed & (1u << BTN_RT)) bodyOff = constrain(bodyOff - 5.0f, -BODY_OFF_MAX, BODY_OFF_MAX);
 
     if (hat != prevHat && hat >= 0 && hat <= 7) {
       const bool up    = (hat == 7 || hat == 0 || hat == 1);
@@ -775,19 +714,16 @@ void loop() {
       const bool left  = (hat >= 5 && hat <= 7);
       if (up)    stepHeight = constrain(stepHeight + 5, 20, 100);
       if (down)  stepHeight = constrain(stepHeight - 5, 20, 100);
-      if (right) cycleHz    = constrain(cycleHz + 0.1f, 0.3f, 1.5f);
-      if (left)  cycleHz    = constrain(cycleHz - 0.1f, 0.3f, 1.5f);
+      if (right) cycleHz    = constrain(cycleHz + 0.1f, 0.2f, 1.0f);
+      if (left)  cycleHz    = constrain(cycleHz - 0.1f, 0.2f, 1.0f);
     }
     prevHat = hat;
 
-    bodyZ = constrain(bodyZ + ry * 40.0f * dt, Z_MIN, Z_MAX);
+    bodyOff = constrain(bodyOff - ry * 30.0f * dt, -BODY_OFF_MAX, BODY_OFF_MAX);
 
-    if (armed) {
-      vx  = -ly;
-      vy  = -lx;
+    if (armed && poseStand) {
+      vx  = -ly;          // stick up = forward
       rot = -rx;
-      float mag = sqrtf(vx * vx + vy * vy);
-      if (mag > 1.0f) { vx /= mag; vy /= mag; }
     }
 
     if (dbg) {
@@ -804,23 +740,34 @@ void loop() {
     prevButtons = 0;
   }
 
-  // ---- gait ----
-  const bool moving = (fabsf(vx) > 0.01f || fabsf(vy) > 0.01f || fabsf(rot) > 0.01f);
+  // ---- gait clock ----
+  const bool moving = (fabsf(vx) > 0.01f || fabsf(rot) > 0.01f);
+  if (moving != wasMoving) {
+    wasMoving = moving;
+    Serial.println(moving ? "WALKING" : "stopped");
+  }
   if (moving) {
-    gaitT += cycleHz * dt;
+    float deflect = constrain(fmaxf(fabsf(vx), fabsf(rot)), 0.4f, 1.0f);
+    gaitT += cycleHz * deflect * dt;
     if (gaitT >= 1.0f) gaitT -= 1.0f;
   }
 
-  for (int i = 0; i < 6; i++) {
-    Vec3 goal = footTarget(i, vx, vy, rot, moving);
-    target[i].x += (goal.x - target[i].x) * SMOOTHING;
-    target[i].y += (goal.y - target[i].y) * SMOOTHING;
-    target[i].z += (goal.z - target[i].z) * SMOOTHING;
-    writeLeg(i);
+  // ---- legs ----
+  if (poseStand) {
+    for (int i = 0; i < 6; i++) {
+      float a[3];
+      computeLegAngles(i, vx, rot, moving, a);
+      writeServo(i, 0, a[0]);
+      writeServo(i, 1, a[1]);
+      writeServo(i, 2, a[2]);
+    }
+  } else {
+    writePose(SIT_POSE);
   }
 
-  // ---- battery + OLED (after servos are updated, so legs never wait on it) ----
-  updateBattery(now);
+  // ---- battery + OLED ----
+  static uint32_t lastBatt = 0;
+  if (now - lastBatt >= 100) { lastBatt = now; updateBattery(now); }
   if (oledOk && now - lastOledMs >= OLED_PERIOD_MS) {
     lastOledMs = now;
     drawOLED(now);
