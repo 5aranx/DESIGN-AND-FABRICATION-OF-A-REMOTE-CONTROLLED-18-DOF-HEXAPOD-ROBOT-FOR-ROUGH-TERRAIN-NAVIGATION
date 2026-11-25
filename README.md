@@ -296,7 +296,7 @@ respond as expected, send `d` over Serial and press each control to see which in
 - shahidjnp60@gmail.com - Shahid Khan
 - smarthpanwar191@gmail.com - Smarth Panwar
 - swayampanwar191@gmail.com - Swayam Panwar
-- shrutishravya15@gmail.com - Shruti Shravya
+- shrutishravya18@gmail.com - Shruti Shravya 
 
 ## License
 
